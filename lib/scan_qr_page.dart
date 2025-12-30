@@ -1,137 +1,154 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'dart:async';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 
-class ScanQRPage extends StatefulWidget {
-  const ScanQRPage({super.key});
+class ScanQrPage extends StatefulWidget {
+  const ScanQrPage({super.key});
 
   @override
-  State<ScanQRPage> createState() => _ScanQRPageState();
+  State<ScanQrPage> createState() => _ScanQrPageState();
 }
 
-class _ScanQRPageState extends State<ScanQRPage> {
-  bool isProcessing = false;
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
-  final MobileScannerController cameraController = MobileScannerController();
+class _ScanQrPageState extends State<ScanQrPage> {
+  final MobileScannerController controller = MobileScannerController();
+  bool processing = false;
 
-  // 🔹 Auto-approve borrow request after scanning QR
-  Future<void> _approveBorrowRequest(String requestId) async {
-    try {
-      setState(() => isProcessing = true);
-
-      final doc =
-          await _firestore.collection('borrowRequests').doc(requestId).get();
-
-      if (!doc.exists) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('❌ Invalid QR code or request ID')),
-        );
-        setState(() => isProcessing = false);
-        return;
-      }
-
-      final data = doc.data()!;
-      final itemId = data['itemId'];
-      final borrowerId = data['borrowerId'];
-
-      // Update borrow request
-      await _firestore.collection('borrowRequests').doc(requestId).update({
-        'status': 'approved',
-        'updatedAt': DateTime.now(),
-      });
-
-      // Update item
-      await _firestore.collection('items').doc(itemId).update({
-        'status': 'Borrowed',
-        'borrowerId': borrowerId,
-      });
-
-      // Reward borrower
-      final userRef = _firestore.collection('users').doc(borrowerId);
-      await _firestore.runTransaction((txn) async {
-        final userDoc = await txn.get(userRef);
-        if (userDoc.exists) {
-          final trust = userDoc['trustScore'] ?? 0;
-          txn.update(userRef, {'trustScore': trust + 2});
-        }
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('✅ Borrow request approved successfully!')),
-      );
-
-      await Future.delayed(const Duration(seconds: 1));
-      if (mounted) Navigator.pop(context);
-    } catch (e) {
-      setState(() => isProcessing = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('❌ Error: $e')),
-      );
-    }
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Scan QR to Approve Borrow'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.flip_camera_android),
-            onPressed: () => cameraController.switchCamera(),
-          ),
-        ],
-      ),
-      body: Stack(
-        alignment: Alignment.center,
-        children: [
-          // 🟢 Camera Scanner
-          MobileScanner(
-            controller: cameraController,
-            fit: BoxFit.cover,
-            onDetect: (capture) async {
-              if (isProcessing) return;
-              final barcodes = capture.barcodes;
-              for (final barcode in barcodes) {
-                final String? code = barcode.rawValue;
-                if (code != null && code.trim().isNotEmpty) {
-                  await _approveBorrowRequest(code.trim());
-                }
-              }
-            },
-          ),
+      appBar: AppBar(title: const Text("Scan Borrow QR")),
+      body: MobileScanner(
+        controller: controller,
+        onDetect: (capture) async {
+          if (processing) return;
 
-          // 🟦 Overlay box
-          Container(
-            width: 250,
-            height: 250,
-            decoration: BoxDecoration(
-              border: Border.all(color: Colors.white, width: 3),
-              borderRadius: BorderRadius.circular(16),
-            ),
-          ),
+          final barcode = capture.barcodes.first;
+          final raw = barcode.rawValue;
 
-          // ⏳ Processing overlay
-          if (isProcessing)
-            Container(
-              color: Colors.black54,
-              child: const Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    CircularProgressIndicator(color: Colors.white),
-                    SizedBox(height: 16),
-                    Text(
-                      'Processing approval...',
-                      style: TextStyle(color: Colors.white),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-        ],
+          if (raw == null || raw.isEmpty) return;
+
+          processing = true; // 🔒 硬锁
+          controller.stop(); // 🔒 立刻停 scanner
+
+          await _processQR(context, raw);
+        },
       ),
     );
+  }
+
+  Future<void> _processQR(BuildContext context, String raw) async {
+    debugPrint("========== QR DEBUG ==========");
+debugPrint("RAW STRING: [$raw]");
+debugPrint("RAW LENGTH: ${raw.length}");
+debugPrint("RAW CODE UNITS: ${raw.codeUnits}");
+debugPrint("==============================");
+    try {
+      // 🔥 关键：清洗 QR 字串（mobile_scanner 坑点）
+      final cleaned = raw
+          .trim()
+          .replaceAll(RegExp(r'[\u0000-\u001F\u007F]'), '');
+
+      debugPrint("QR RAW CLEANED = $cleaned");
+
+      // 🔒 必须是 JSON
+      if (!cleaned.startsWith('{') || !cleaned.endsWith('}')) {
+        throw Exception('Not JSON');
+      }
+
+      final Map<String, dynamic> data = jsonDecode(cleaned);
+
+      // 🔒 字段完整性校验
+      final requiredKeys = [
+        'requestId',
+        'itemId',
+        'requesterId',
+        'ownerId',
+        'appointmentTime',
+      ];
+
+      for (final k in requiredKeys) {
+        if (!data.containsKey(k)) {
+          throw Exception('Missing field: $k');
+        }
+      }
+
+      final String requestId = data['requestId'];
+      final String itemId = data['itemId'];
+      final String requesterId = data['requesterId'];
+      final String ownerId = data['ownerId'];
+      final int appointmentMs = data['appointmentTime'];
+
+      final currentUid = FirebaseAuth.instance.currentUser!.uid;
+
+      // 🔒 只有 owner 能扫
+      if (currentUid != ownerId) {
+        _exit("❌ 只有 Owner 可以确认借出");
+        return;
+      }
+
+      final reqRef =
+          FirebaseFirestore.instance.collection('borrowRequests').doc(requestId);
+      final snap = await reqRef.get();
+
+      if (!snap.exists) {
+        _exit("❌ 请求不存在");
+        return;
+      }
+
+      final req = snap.data()!;
+
+      if (req['status'] != 'approved') {
+        _exit("⚠️ 请求已处理或不可用");
+        return;
+      }
+
+      // ⏱️ 时间校验（宽松版）
+      final apptTime =
+          DateTime.fromMillisecondsSinceEpoch(appointmentMs).toLocal();
+      final diff = DateTime.now().difference(apptTime).inHours.abs();
+
+      if (diff > 48) {
+        _exit("⚠️ 不在预约时间范围内");
+        return;
+      }
+
+      // ✅ 确认借出
+      await reqRef.update({
+        'status': 'borrowed',
+        'borrowedAt': FieldValue.serverTimestamp(),
+      });
+
+      await FirebaseFirestore.instance
+          .collection('items')
+          .doc(itemId)
+          .update({
+        'status': 'borrowed',
+        'borrowerId': requesterId,
+      });
+
+      _exit("✅ 借出成功确认！");
+    } catch (e) {
+      debugPrint("QR PARSE ERROR = $e");
+      _exit("❌ QR 无效或解析失败");
+    }
+  }
+
+  void _exit(String msg) async {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(msg)));
+
+    await Future.delayed(const Duration(milliseconds: 400));
+
+    if (mounted) {
+      Navigator.pop(context);
+    }
   }
 }
